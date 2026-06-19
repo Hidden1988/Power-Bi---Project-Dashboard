@@ -1,0 +1,74 @@
+{
+  "swagger": "2.0",
+  "info": {
+    "title": "Storco Claude Bot",
+    "description": "Chat with Claude from a Power Apps canvas app embedded in Power BI.",
+    "version": "1.0.0"
+  },
+  "host": "REPLACE-WITH-YOUR-HOST.reliablehosting.au",
+  "basePath": "/",
+  "schemes": ["https"],
+  "consumes": ["application/json"],
+  "produces": ["application/json"],
+  "paths": {
+    "/chat": {
+      "post": {
+        "summary": "Send a chat turn to Claude",
+        "description": "Sends the full conversation history plus optional report context and returns Claude's reply.",
+        "operationId": "Chat",
+        "parameters": [
+          {
+            "name": "body",
+            "in": "body",
+            "required": true,
+            "schema": { "$ref": "#/definitions/ChatRequest" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Claude's reply",
+            "schema": { "$ref": "#/definitions/ChatResponse" }
+          },
+          "401": { "description": "Invalid API key" }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "ChatRequest": {
+      "type": "object",
+      "required": ["messages"],
+      "properties": {
+        "messages": {
+          "type": "array",
+          "description": "Full conversation history, oldest first.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "role": { "type": "string", "description": "user or assistant" },
+              "content": { "type": "string", "description": "Message text" }
+            }
+          }
+        },
+        "report_context": {
+          "type": "string",
+          "description": "Current Power BI filter/selection context (optional)."
+        }
+      }
+    },
+    "ChatResponse": {
+      "type": "object",
+      "properties": {
+        "reply": { "type": "string", "description": "Claude's reply text" }
+      }
+    }
+  },
+  "securityDefinitions": {
+    "api_key": {
+      "type": "apiKey",
+      "in": "header",
+      "name": "x-api-key"
+    }
+  },
+  "security": [ { "api_key": [] } ]
+}
