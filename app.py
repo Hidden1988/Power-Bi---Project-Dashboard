@@ -154,6 +154,9 @@ async def _async_const(value):
 # ---------------------------------------------------------------------------
 
 ACONEX_ORG_ID = "1476470689"   # from your Aconex Cost playbook
+# Aconex FIELD uses a different organization id space than Cost (e.g. 18790xxxxx).
+# Set ACONEX_FIELD_ORG_ID in Render; leave blank to require the model to pass it.
+FIELD_ORG_ID = os.environ.get("ACONEX_FIELD_ORG_ID", "")
 # Real Cost prefix (from your server: `${ACONEX_HOST}/cost/api/organizations/${ORG}${path}`)
 COST = f"/cost/api/organizations/{ACONEX_ORG_ID}"
 
@@ -217,6 +220,58 @@ TOOLS = [
                 "page_number": {"type": "integer", "description": "1-based page index, default 1"},
             },
             "required": ["project_id", "area_id"],
+        },
+    },
+    {
+        "name": "aconex_field_daily_reports_filter",
+        "module": "aconex_field",
+        "path": "/field-management/api/projects/{project_id}/daily-reports/filter",
+        "query": lambda a: {k: v for k, v in {
+            "organizationId": a.get("organizationId") or FIELD_ORG_ID,
+            "dailyreport_daterange": a["dailyreport_daterange"],
+            "status": a.get("status", ""),          # e.g. "approved" for completed reports
+            "offset_from_utc": a.get("offset_from_utc", "600"),  # AEST = +600 min
+            "search_string": a.get("search_string", ""),
+            "delay": a.get("delay", ""),
+            "report_owner": a.get("report_owner", ""),
+        }.items() if v not in (None, "")},
+        "description": (
+            "List Aconex Field DAILY REPORTS (site reports/diary) for a project, "
+            "filtered by date range. A 'site report' is a Daily Report, not a "
+            "checklist. dailyreport_daterange is YYYYMMDD-YYYYMMDD. status filters by "
+            "not_started/in_progress/approved (use 'approved' for COMPLETED reports). "
+            "Note: the API returns dummy not_started rows for dates with no report, so "
+            "always filter status=approved when the user wants completed reports. "
+            "Returns id, status, dailyReportDate per report; use "
+            "aconex_field_daily_report_get for full detail incl. who/when."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "dailyreport_daterange": {"type": "string", "description": "YYYYMMDD-YYYYMMDD, e.g. 20260101-20260331"},
+                "status": {"type": "string", "description": "not_started, in_progress, approved (comma-separated). Use 'approved' for completed."},
+                "organizationId": {"type": "string", "description": "Aconex org id (defaults to Storco's)"},
+                "search_string": {"type": "string"},
+                "report_owner": {"type": "string", "description": "comma-separated report owner ids"},
+            },
+            "required": ["project_id", "dailyreport_daterange"],
+        },
+    },
+    {
+        "name": "aconex_field_daily_report_get",
+        "module": "aconex_field",
+        "path": "/field-management/api/projects/{project_id}/daily-reports/{dailyreport_id}",
+        "query": lambda a: {"type": "DAILY_REPORT"},
+        "description": ("Get one Aconex Field daily report by id (full detail, including "
+                        "meta_data for who created/updated it and when, status, and items)."),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "dailyreport_id": {"type": "string"},
+            },
+            "required": ["project_id", "dailyreport_id"],
         },
     },
     {
