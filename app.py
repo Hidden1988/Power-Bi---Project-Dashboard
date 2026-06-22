@@ -346,9 +346,15 @@ TOOLS += [
         "prefix": "/field-management/api",
         "description": (
             "GET any Aconex Field endpoint (read-only). `path` is relative to "
-            "/field-management/api. Families: /projects, /projects/{projectId}/areas, "
-            "/projects/{projectId}/areas/{areaId}/issues, and other Field resources. "
-            "Example: /projects/1879048409/areas"
+            "/field-management/api. Aconex Field has DISTINCT record types - do not "
+            "confuse them: Daily Reports (the daily site reports/diary), Checklists "
+            "(inspections), Issues (defects/punch items), Observations (safety), and "
+            "Templates. Families: /projects, /projects/{projectId}/areas, "
+            "/projects/{projectId}/areas/{areaId}/issues, "
+            "/projects/{projectId}/daily-reports, /projects/{projectId}/checklists, "
+            "/projects/{projectId}/observations, /projects/{projectId}/templates. "
+            "A 'site report' means a Daily Report, NOT a checklist. "
+            "Example: /projects/1879048409/daily-reports"
         ),
         "input_schema": {
             "type": "object",
@@ -464,7 +470,13 @@ SYSTEM_BASE = (
     "than concluding it is empty.\n\n"
     "If any tool result ends with [RESULT TRUNCATED], the data was cut off - do not "
     "present the last record as complete; fetch the rest via pagination or a "
-    "narrower query and combine before answering."
+    "narrower query and combine before answering.\n\n"
+    "Aconex Field has distinct record types: Daily Reports (site reports/diary), "
+    "Checklists (inspections), Issues (defects), and Observations (safety). These "
+    "are NOT interchangeable. When asked for a specific type, query that exact type; "
+    "if you can only find a different type, say so explicitly rather than presenting "
+    "it as the thing requested (e.g. never return a checklist when asked for a site "
+    "report without flagging that it is a checklist, not a report)."
 )
 
 
