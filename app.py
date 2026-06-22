@@ -251,12 +251,24 @@ TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "primavera_list_projects",
+        "name": "primavera_list_workspaces",
         "module": "primavera",
-        "path": "/api/restapi/project",                  # CONFIRM path + required params
+        "path": "/api/restapi/workspace",
         "query": lambda a: {},
-        "description": "List Primavera Cloud projects visible to the service account.",
+        "description": "List Primavera Cloud workspaces. Workspace ids are needed to list projects.",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "primavera_list_projects_by_workspace",
+        "module": "primavera",
+        "path": "/api/restapi/project/workspace/{workspaceId}",
+        "query": lambda a: {},
+        "description": "List Primavera Cloud projects within a workspace (id from primavera_list_workspaces).",
+        "input_schema": {
+            "type": "object",
+            "properties": {"workspaceId": {"type": "string"}},
+            "required": ["workspaceId"],
+        },
     },
 ]
 
