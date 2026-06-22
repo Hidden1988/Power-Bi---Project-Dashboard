@@ -93,8 +93,9 @@ async def _primavera_headers(client: httpx.AsyncClient) -> dict:
         data={"grant_type": "client_credentials"},
     )
     if r.status_code in (401, 403):
-        raise RuntimeError(f"Primavera auth failed ({r.status_code}): bad service credentials")
-    r.raise_for_status()
+        raise RuntimeError(f"Primavera token handshake failed ({r.status_code}): bad service credentials")
+    if r.status_code < 200 or r.status_code >= 300:
+        raise RuntimeError(f"Primavera token handshake failed ({r.status_code}): {r.text[:300]}")
 
     text = r.text.strip()
     token = text
@@ -242,9 +243,17 @@ TOOLS = [
         },
     },
     {
+        "name": "primavera_test_connection",
+        "module": "primavera",
+        "path": "/api/restapi/util/testConnection",
+        "query": lambda a: {},
+        "description": "Verify the Primavera token/handshake works. Returns OK if authenticated.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "primavera_list_projects",
         "module": "primavera",
-        "path": "/api/restapi/project",                  # CONFIRM path
+        "path": "/api/restapi/project",                  # CONFIRM path + required params
         "query": lambda a: {},
         "description": "List Primavera Cloud projects visible to the service account.",
         "input_schema": {"type": "object", "properties": {}},
