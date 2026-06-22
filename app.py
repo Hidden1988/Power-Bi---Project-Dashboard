@@ -211,6 +211,15 @@ TOOLS = [
         },
     },
     {
+        "name": "aconex_mail_list_projects",
+        "module": "aconex_mail",
+        "path": "/api/projects",
+        "query": lambda a: {},
+        "accept": "application/xml",
+        "description": "List Aconex projects available for Mail (use these ids for aconex_mail_list). Returns XML.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "aconex_mail_list",
         "module": "aconex_mail",
         "path": "/api/projects/{project_id}/mail",
