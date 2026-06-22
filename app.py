@@ -1,141 +1,208 @@
 """
-Storco Power BI -> Power Apps -> Claude chat backend.
-Auth-broker / MCP-client version.
+Storco all-in-one READ-ONLY data backend for the Power BI / Power Apps Claude bot.
 
-WHY THIS SHAPE:
-The Anthropic Messages API, when given an `mcp_servers` block, connects to those
-servers DIRECTLY and can only send `Authorization: Bearer`. Storco's MCP servers
-each want a different caller header (X-User-Access-Token, Basic, or none), so the
-API path can't authenticate to them. Instead this backend acts as the MCP *client*:
-it connects to each server with the correct header, lists their tools, and runs the
-tool-use loop itself. The backend is now in the path, so it controls auth.
+Talks DIRECTLY to the underlying REST APIs (Primavera Cloud, Aconex Cost/Field/Mail)
+using Storco SERVICE credentials held server-side. No MCP servers, no per-user login,
+no enrolment sessions. Every tool is a GET. (Primavera performs one internal POST to
+mint its bearer token during the auth handshake - that is not a user-facing write.)
 
-Service-identity model: one set of Storco read-only credentials, held server-side,
-used for every report viewer. View-only.
+ADDING A READ TOOL = append one entry to TOOLS (see the pattern block at the bottom).
 
-Env vars (set in Render dashboard, never in .env):
-    ANTHROPIC_API_KEY     - Anthropic key
-    CONNECTOR_API_KEY     - shared secret the Power Apps connector sends
-    ENABLED_SERVERS       - comma list, e.g. "aconex_cost" (start with one)
-    ACONEX_COST_TOKEN     - value for the X-User-Access-Token header
-    ACONEX_MAIL_BASIC     - "user:pass" for Aconex Mail (encoded to Basic)
-    ACONEX_FIELD_BASIC    - "user:pass" for Aconex Field
-    PRIMAVERA_BASIC       - "user:pass" for Primavera handshake (optional)
+Env vars (Render dashboard only, never in .env):
+    ANTHROPIC_API_KEY
+    CONNECTOR_API_KEY        - shared secret the Power Apps connector sends
+
+    # Primavera (Basic -> handshake -> bearer token)
+    PRIMAVERA_BASE_URL       - e.g. https://primavera-au1.oraclecloud.com
+    PRIMAVERA_TOKEN_URL      - full URL of the token/handshake endpoint
+    PRIMAVERA_USERNAME
+    PRIMAVERA_PASSWORD
+
+    # Aconex (host shared by Field/Mail/Cost REST; auth differs per module)
+    ACONEX_BASE_URL          - e.g. https://au1.aconex.com
+    ACONEX_COST_TOKEN        - static X-User-Access-Token (service)
+    ACONEX_FIELD_BASIC       - "user:pass" for Field
+    ACONEX_MAIL_BASIC        - "user:pass" for Mail
 """
 
 import os
-import re
-import json
+import time
 import base64
 import anthropic
+import httpx
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
-from fastmcp import Client
-from fastmcp.client.transports import StreamableHttpTransport
+from typing import Optional, List, Callable
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CONNECTOR_API_KEY = os.environ["CONNECTOR_API_KEY"]
-ENABLED = [s.strip() for s in os.environ.get("ENABLED_SERVERS", "aconex_cost").split(",") if s.strip()]
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
-MAX_TOOL_ROUNDS = 6   # safety cap on the agentic loop
+MAX_TOOL_ROUNDS = 6
 
-
-def _basic(creds: Optional[str]) -> dict:
-    """Turn 'user:pass' into an Authorization: Basic header."""
-    if not creds:
-        return {}
-    token = base64.b64encode(creds.encode()).decode()
-    return {"Authorization": f"Basic {token}"}
-
-
-# Per-server config: URL + the header THIS server expects from its caller.
-SERVER_CONFIG = {
-    "primavera": {
-        "url": "https://primavera-mcp.onrender.com/mcp",
-        "headers": _basic(os.environ.get("PRIMAVERA_BASIC")),  # often {} - self-auths
-    },
-    "aconex_cost": {
-        "url": "https://storcoaconex.reliablehosting.au/mcp",
-        "headers": ({"X-User-Access-Token": os.environ["ACONEX_COST_TOKEN"]}
-                    if os.environ.get("ACONEX_COST_TOKEN") else {}),
-    },
-    "aconex_mail": {
-        "url": "https://aconex-mail.onrender.com/mcp",
-        "headers": _basic(os.environ.get("ACONEX_MAIL_BASIC")),
-    },
-    "aconex_field": {
-        "url": "https://aconex-field.onrender.com/mcp",
-        "headers": _basic(os.environ.get("ACONEX_FIELD_BASIC")),
-    },
-}
-
-# Short prefixes keep Anthropic tool names within the 64-char / charset limit.
-PREFIX = {"primavera": "pv", "aconex_cost": "ac", "aconex_mail": "am", "aconex_field": "af"}
-
-app = FastAPI(title="Storco Power BI Claude Bot (MCP broker)")
+app = FastAPI(title="Storco read-only data backend")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["POST", "OPTIONS"], allow_headers=["*"],
 )
 aclient = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 
-def _mcp_client(server: str) -> Client:
-    cfg = SERVER_CONFIG[server]
-    return Client(StreamableHttpTransport(cfg["url"], headers=cfg["headers"]))
+# ---------------------------------------------------------------------------
+# AUTH - one resolver per module. Returns the headers for an upstream request.
+# ---------------------------------------------------------------------------
+
+def _basic_header(creds: Optional[str]) -> dict:
+    if not creds:
+        return {}
+    return {"Authorization": "Basic " + base64.b64encode(creds.encode()).decode()}
 
 
-def _safe_name(server: str, tool: str) -> str:
-    name = f"{PREFIX[server]}_{tool}"
-    name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-    return name[:64]
+_pv_token = {"value": None, "exp": 0.0}
+
+async def _primavera_headers(client: httpx.AsyncClient) -> dict:
+    """Basic-auth handshake -> bearer token, cached until it nears expiry."""
+    if _pv_token["value"] and time.time() < _pv_token["exp"]:
+        return {"Authorization": f"Bearer {_pv_token['value']}"}
+    basic = _basic_header(f"{os.environ['PRIMAVERA_USERNAME']}:{os.environ['PRIMAVERA_PASSWORD']}")
+    r = await client.post(os.environ["PRIMAVERA_TOKEN_URL"], headers=basic)
+    r.raise_for_status()
+    data = r.json()
+    token = data["access_token"]                 # CONFIRM: field name from your tenant
+    _pv_token["value"] = token
+    _pv_token["exp"] = time.time() + data.get("expires_in", 3600) - 60
+    return {"Authorization": f"Bearer {token}"}
 
 
-async def discover_tools():
-    """Connect to each enabled server, list tools, build the Anthropic tools array,
-    a routing map from anthropic-name -> (server, real_tool_name), and a dict of
-    any servers that failed to connect (skipped, not fatal)."""
-    tools, routing, skipped = [], {}, {}
-    for server in ENABLED:
-        if server not in SERVER_CONFIG:
-            continue
-        try:
-            async with _mcp_client(server) as client:
-                server_tools = await client.list_tools()
-        except Exception as e:
-            skipped[server] = str(e)   # one bad server shouldn't kill the rest
-            continue
-        for t in server_tools:
-            aname = _safe_name(server, t.name)
-            routing[aname] = (server, t.name)
-            tools.append({
-                "name": aname,
-                "description": (t.description or "")[:1000],
-                "input_schema": t.inputSchema or {"type": "object", "properties": {}},
-            })
-    return tools, routing, skipped
+# base = URL prefix for the module; auth = async fn(client) -> headers dict
+MODULES = {
+    "primavera": {
+        "base": os.environ.get("PRIMAVERA_BASE_URL", ""),
+        "auth": _primavera_headers,
+    },
+    "aconex_cost": {
+        "base": os.environ.get("ACONEX_BASE_URL", ""),
+        "auth": lambda c: _async_const({"X-User-Access-Token": os.environ.get("ACONEX_COST_TOKEN", "")}),
+    },
+    "aconex_field": {
+        "base": os.environ.get("ACONEX_BASE_URL", ""),
+        "auth": lambda c: _async_const(_basic_header(os.environ.get("ACONEX_FIELD_BASIC"))),
+    },
+    "aconex_mail": {
+        "base": os.environ.get("ACONEX_BASE_URL", ""),
+        "auth": lambda c: _async_const(_basic_header(os.environ.get("ACONEX_MAIL_BASIC"))),
+    },
+}
+
+async def _async_const(value):
+    return value
 
 
-def _result_text(result) -> str:
-    parts = []
-    for block in getattr(result, "content", None) or []:
-        txt = getattr(block, "text", None)
-        if txt:
-            parts.append(txt)
-    if parts:
-        return "\n".join(parts)
-    sc = getattr(result, "structured_content", None) or getattr(result, "data", None)
-    return json.dumps(sc, default=str) if sc is not None else "(empty result)"
+# ---------------------------------------------------------------------------
+# TOOL REGISTRY - each entry is one read endpoint exposed to Claude.
+#   name         : unique, [a-zA-Z0-9_-], <=64 chars
+#   module       : key into MODULES (decides base URL + auth)
+#   path         : appended to base; may contain {placeholders} filled from args
+#   query        : optional fn(args) -> dict of query-string params
+#   input_schema : JSON schema for the args Claude must supply
+# Paths/params below are best-effort starting points - CONFIRM each against your
+# own API knowledge (you built the MCP servers, so you have the real shapes).
+# ---------------------------------------------------------------------------
+
+ACONEX_ORG_ID = "1476470689"   # from your Aconex Cost playbook
+
+TOOLS = [
+    {
+        "name": "aconex_cost_list_projects",
+        "module": "aconex_cost",
+        "path": "/cost/api/v1/projects",
+        "query": lambda a: {"organizationId": ACONEX_ORG_ID},
+        "description": "List Aconex Cost projects for the Storco organisation.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "aconex_cost_get_project",
+        "module": "aconex_cost",
+        "path": "/cost/api/v1/projects/{projectId}",
+        "query": lambda a: {},
+        "description": "Get one Aconex Cost project by its numeric id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"projectId": {"type": "string", "description": "Cost project id"}},
+            "required": ["projectId"],
+        },
+    },
+    {
+        "name": "aconex_field_list_issues",
+        "module": "aconex_field",
+        "path": "/api/projects/{projectId}/issues",     # CONFIRM path
+        "query": lambda a: {"page_size": a.get("limit", 50)},
+        "description": "List Aconex Field issues (defects/punch items) for a project.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "projectId": {"type": "string"},
+                "limit": {"type": "integer", "description": "max rows, default 50"},
+            },
+            "required": ["projectId"],
+        },
+    },
+    {
+        "name": "aconex_mail_list",
+        "module": "aconex_mail",
+        "path": "/api/projects/{projectId}/mail",        # CONFIRM path
+        "query": lambda a: {"mail_box": a.get("box", "inbox")},
+        "description": "List Aconex Mail items in a project inbox/sentbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "projectId": {"type": "string"},
+                "box": {"type": "string", "description": "inbox or sentbox"},
+            },
+            "required": ["projectId"],
+        },
+    },
+    {
+        "name": "primavera_list_projects",
+        "module": "primavera",
+        "path": "/api/restapi/project",                  # CONFIRM path
+        "query": lambda a: {},
+        "description": "List Primavera Cloud projects visible to the service account.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
-async def call_tool(server: str, tool: str, args: dict) -> str:
-    async with _mcp_client(server) as client:
-        result = await client.call_tool(tool, args or {})
-    return _result_text(result)
+def anthropic_tools():
+    return [
+        {"name": t["name"], "description": t["description"], "input_schema": t["input_schema"]}
+        for t in TOOLS
+    ]
 
+
+async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
+    tool = TOOLS_BY_NAME.get(name)
+    if not tool:
+        return f"Unknown tool {name}"
+    mod = MODULES[tool["module"]]
+    if not mod["base"]:
+        return f"Module {tool['module']} is not configured (missing base URL/credentials)."
+    headers = await mod["auth"](client)
+    headers["Accept"] = "application/json"
+    path = tool["path"].format(**args) if "{" in tool["path"] else tool["path"]
+    url = mod["base"].rstrip("/") + path
+    params = tool.get("query", lambda a: {})(args)
+    r = await client.get(url, headers=headers, params=params)
+    r.raise_for_status()
+    return r.text[:20000]
+
+
+# ---------------------------------------------------------------------------
+# CHAT - tool-use loop. Identical contract to the connector: messages in, reply out.
+# ---------------------------------------------------------------------------
 
 class Message(BaseModel):
     role: str
@@ -152,24 +219,19 @@ class ChatResponse(BaseModel):
 
 
 SYSTEM_BASE = (
-    "You are Storco's project analytics assistant, embedded inside a Power BI "
-    "report used by project and construction managers. You can query live Storco "
-    "data through the connected tools. Use them when a question needs current "
-    "data; otherwise answer directly. This is a read-only tool - never attempt to "
-    "create, update, or delete anything. Reply in plain prose, no Markdown, no "
-    "asterisks or hash headers. Be concise."
+    "You are Storco's project analytics assistant, embedded in a Power BI report for "
+    "project and construction managers. You can read live Storco data through the "
+    "connected tools (Primavera schedules, Aconex cost/field/mail). Use them when a "
+    "question needs current data; otherwise answer directly. This is a strictly "
+    "read-only tool. Reply in plain prose, no Markdown, no asterisks or hash headers. "
+    "Be concise."
 )
 
 
 @app.get("/health")
 async def health():
-    try:
-        tools, _, skipped = await discover_tools()
-        status = "ok" if tools else "degraded"
-        return {"status": status, "model": MODEL, "enabled": ENABLED,
-                "tool_count": len(tools), "skipped": skipped}
-    except Exception as e:
-        return {"status": "degraded", "enabled": ENABLED, "error": str(e)}
+    configured = {m: bool(cfg["base"]) for m, cfg in MODULES.items()}
+    return {"status": "ok", "model": MODEL, "tool_count": len(TOOLS), "modules_configured": configured}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -177,37 +239,60 @@ async def chat(req: ChatRequest, x_api_key: str = Header(default="")):
     if x_api_key != CONNECTOR_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    tools, routing, _ = await discover_tools()
-
     system = SYSTEM_BASE
     if req.report_context:
         system += f"\n\nCurrent report context:\n{req.report_context}"
 
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
+    tools = anthropic_tools()
 
-    for _ in range(MAX_TOOL_ROUNDS):
-        resp = await aclient.messages.create(
-            model=MODEL, max_tokens=MAX_TOKENS, system=system,
-            tools=tools, messages=messages,
-        )
-        if resp.stop_reason != "tool_use":
-            text = "".join(b.text for b in resp.content if b.type == "text")
-            return ChatResponse(reply=text or "(no text response)")
+    async with httpx.AsyncClient(timeout=60) as client:
+        for _ in range(MAX_TOOL_ROUNDS):
+            resp = await aclient.messages.create(
+                model=MODEL, max_tokens=MAX_TOKENS, system=system, tools=tools, messages=messages,
+            )
+            if resp.stop_reason != "tool_use":
+                text = "".join(b.text for b in resp.content if b.type == "text")
+                return ChatResponse(reply=text or "(no text response)")
 
-        # Execute every tool the model asked for, feed results back, loop.
-        messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
-        tool_results = []
-        for b in resp.content:
-            if b.type == "tool_use":
-                server, real = routing.get(b.name, (None, None))
-                if server is None:
-                    out = f"Unknown tool {b.name}"
-                else:
+            messages.append({"role": "assistant", "content": [b.model_dump() for b in resp.content]})
+            results = []
+            for b in resp.content:
+                if b.type == "tool_use":
                     try:
-                        out = await call_tool(server, real, b.input)
+                        out = await run_tool(b.name, b.input or {}, client)
+                    except httpx.HTTPStatusError as e:
+                        out = f"HTTP {e.response.status_code}: {e.response.text[:500]}"
                     except Exception as e:
                         out = f"Tool error: {e}"
-                tool_results.append({"type": "tool_result", "tool_use_id": b.id, "content": out[:20000]})
-        messages.append({"role": "user", "content": tool_results})
+                    results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+            messages.append({"role": "user", "content": results})
 
     return ChatResponse(reply="(stopped after maximum tool rounds)")
+
+
+# ---------------------------------------------------------------------------
+# PATTERN: to add a read tool, append a dict to TOOLS above. Example -
+#
+#   {
+#       "name": "aconex_cost_list_contracts",
+#       "module": "aconex_cost",
+#       "path": "/cost/api/v1/contracts",
+#       # organizationRole is mandatory or the endpoint 500s (per your playbook):
+#       "query": lambda a: {"organizationId": ACONEX_ORG_ID,
+#                            "projectId": a["projectId"],
+#                            "organizationRole": a.get("role", "UPSTREAM")},
+#       "description": "List contracts for an Aconex Cost project.",
+#       "input_schema": {
+#           "type": "object",
+#           "properties": {
+#               "projectId": {"type": "string"},
+#               "role": {"type": "string", "description": "UPSTREAM or DOWNSTREAM"},
+#           },
+#           "required": ["projectId"],
+#       },
+#   },
+#
+# That's it - no other code changes. Keep everything GET. Bake mandatory params
+# (like organizationRole) into the query fn so Claude can't omit them.
+# ---------------------------------------------------------------------------
