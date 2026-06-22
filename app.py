@@ -95,22 +95,28 @@ def _safe_name(server: str, tool: str) -> str:
 
 
 async def discover_tools():
-    """Connect to each enabled server, list tools, build the Anthropic tools array
-    and a routing map from anthropic-name -> (server, real_tool_name)."""
-    tools, routing = [], {}
+    """Connect to each enabled server, list tools, build the Anthropic tools array,
+    a routing map from anthropic-name -> (server, real_tool_name), and a dict of
+    any servers that failed to connect (skipped, not fatal)."""
+    tools, routing, skipped = [], {}, {}
     for server in ENABLED:
         if server not in SERVER_CONFIG:
             continue
-        async with _mcp_client(server) as client:
-            for t in await client.list_tools():
-                aname = _safe_name(server, t.name)
-                routing[aname] = (server, t.name)
-                tools.append({
-                    "name": aname,
-                    "description": (t.description or "")[:1000],
-                    "input_schema": t.inputSchema or {"type": "object", "properties": {}},
-                })
-    return tools, routing
+        try:
+            async with _mcp_client(server) as client:
+                server_tools = await client.list_tools()
+        except Exception as e:
+            skipped[server] = str(e)   # one bad server shouldn't kill the rest
+            continue
+        for t in server_tools:
+            aname = _safe_name(server, t.name)
+            routing[aname] = (server, t.name)
+            tools.append({
+                "name": aname,
+                "description": (t.description or "")[:1000],
+                "input_schema": t.inputSchema or {"type": "object", "properties": {}},
+            })
+    return tools, routing, skipped
 
 
 def _result_text(result) -> str:
@@ -158,8 +164,10 @@ SYSTEM_BASE = (
 @app.get("/health")
 async def health():
     try:
-        tools, _ = await discover_tools()
-        return {"status": "ok", "model": MODEL, "enabled": ENABLED, "tool_count": len(tools)}
+        tools, _, skipped = await discover_tools()
+        status = "ok" if tools else "degraded"
+        return {"status": status, "model": MODEL, "enabled": ENABLED,
+                "tool_count": len(tools), "skipped": skipped}
     except Exception as e:
         return {"status": "degraded", "enabled": ENABLED, "error": str(e)}
 
@@ -169,7 +177,7 @@ async def chat(req: ChatRequest, x_api_key: str = Header(default="")):
     if x_api_key != CONNECTOR_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
-    tools, routing = await discover_tools()
+    tools, routing, _ = await discover_tools()
 
     system = SYSTEM_BASE
     if req.report_context:
