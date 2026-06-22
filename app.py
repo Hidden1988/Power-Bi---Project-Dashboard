@@ -230,6 +230,23 @@ TOOLS = [
         },
     },
     {
+        "name": "aconex_list_org_users",
+        "module": "aconex_mail",   # Connect API (/api/...) host, same as Mail
+        "path": "/api/organizations/1476470689/users",
+        "query": lambda a: {"page_size": a.get("page_size", 1000)},
+        "accept": "application/json",
+        "description": (
+            "List all 48 users in the Storco Aconex organisation (Connect API). Returns "
+            "userId, userFirstName, userLastName, userEmail per user. The userId values "
+            "are what the daily-reports filter needs as its report_owner ids."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"page_size": {"type": "integer", "description": "default 1000"}},
+            "required": [],
+        },
+    },
+    {
         "name": "aconex_field_daily_reports_filter",
         "module": "aconex_field",
         "path": "/field-management/api/projects/{project_id}/daily-reports/filter",
@@ -245,12 +262,13 @@ TOOLS = [
         "description": (
             "List Aconex Field DAILY REPORTS (site reports/diary) for a project, "
             "filtered by date range. A 'site report' is a Daily Report, not a "
-            "checklist. dailyreport_daterange is YYYYMMDD-YYYYMMDD. dailyreport_status "
-            "filters by not_started/in_progress/submitted - use 'submitted' for "
-            "COMPLETED reports. Note: the API returns dummy not_started rows for dates "
-            "with no report, so filter dailyreport_status=submitted when the user wants "
-            "completed reports. Returns id, status, dailyReportDate per report; use "
-            "aconex_field_daily_report_get for full detail incl. who/when."
+            "checklist. IMPORTANT: without report_owner ids the API returns only dummy "
+            "not_started placeholder rows (id=null). To see REAL submitted reports you "
+            "MUST first call aconex_list_org_users, collect the userId values, and pass "
+            "them as a comma-separated report_owner. dailyreport_daterange is "
+            "YYYYMMDD-YYYYMMDD. Use dailyreport_status=submitted for COMPLETED reports. "
+            "Returns id, status, dailyReportDate per report; then use "
+            "aconex_field_daily_report_get for who/when detail."
         ),
         "input_schema": {
             "type": "object",
@@ -539,7 +557,13 @@ SYSTEM_BASE = (
     "are NOT interchangeable. When asked for a specific type, query that exact type; "
     "if you can only find a different type, say so explicitly rather than presenting "
     "it as the thing requested (e.g. never return a checklist when asked for a site "
-    "report without flagging that it is a checklist, not a report)."
+    "report without flagging that it is a checklist, not a report).\n\n"
+    "Daily reports lookup: the daily-reports filter returns only dummy not_started "
+    "rows unless report_owner ids are supplied. So to find real/completed site "
+    "reports: (1) call aconex_list_org_users and collect the userId values, (2) call "
+    "aconex_field_daily_reports_filter with report_owner set to those ids "
+    "(comma-separated) and dailyreport_status=submitted, (3) take the latest and call "
+    "aconex_field_daily_report_get for who completed it and when."
 )
 
 
