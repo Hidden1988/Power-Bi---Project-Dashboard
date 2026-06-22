@@ -42,7 +42,8 @@ CONNECTOR_API_KEY = os.environ.get("CONNECTOR_API_KEY", "")  # empty/unset = aut
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
 MAX_TOOL_ROUNDS = 12          # higher: pagination needs several tool round-trips
-MAX_RESULT_CHARS = 60000     # per tool result returned to the model
+MAX_RESULT_CHARS = 200000    # ~50k tokens per tool result; high enough for verbose
+                             # Primavera/Cost objects, low enough to stay a safety net
 
 app = FastAPI(title="Storco read-only data backend")
 app.add_middleware(
@@ -413,7 +414,14 @@ async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
     url = mod["base"].rstrip("/") + path
     r = await client.get(url, headers=headers, params=params)
     r.raise_for_status()
-    return r.text[:MAX_RESULT_CHARS]
+    text = r.text
+    if len(text) > MAX_RESULT_CHARS:
+        text = text[:MAX_RESULT_CHARS] + (
+            "\n\n[RESULT TRUNCATED: the response was longer than the limit and was cut "
+            "here. Do NOT treat the final record as complete. Fetch more with "
+            "pagination (page_number/page_size) or narrow the query, then combine.]"
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +448,23 @@ SYSTEM_BASE = (
     "connected tools (Primavera schedules, Aconex cost/field/mail). Use them when a "
     "question needs current data; otherwise answer directly. This is a strictly "
     "read-only tool. Reply in plain prose, no Markdown, no asterisks or hash headers. "
-    "Be concise."
+    "Be concise.\n\n"
+    "Finding a project: do NOT rely only on listing all projects and scanning the "
+    "results - the list may be paginated and DISABLED/archived projects are often "
+    "omitted from the default list. When a project isn't in the list, it may still "
+    "exist. To locate one: if you have its id, fetch it directly via the get-by-id / "
+    "generic GET tool (e.g. path /projects/{id}); when listing, request disabled "
+    "projects too (e.g. query includeDisabled=true) and page through results before "
+    "concluding a project doesn't exist. Never state a project doesn't exist after a "
+    "single un-paginated active-only list.\n\n"
+    "Primavera workspaces are a TREE. /project/workspace/{id} returns only the "
+    "projects directly in that workspace, NOT those in its child workspaces. For "
+    "'all projects', list every workspace (including children) and query each one; "
+    "if a workspace returns no projects, look for child workspaces beneath it rather "
+    "than concluding it is empty.\n\n"
+    "If any tool result ends with [RESULT TRUNCATED], the data was cut off - do not "
+    "present the last record as complete; fetch the rest via pagination or a "
+    "narrower query and combine before answering."
 )
 
 
