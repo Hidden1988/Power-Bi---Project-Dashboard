@@ -37,7 +37,7 @@ from pydantic import BaseModel
 from typing import Optional, List, Callable
 
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-CONNECTOR_API_KEY = os.environ["CONNECTOR_API_KEY"]
+CONNECTOR_API_KEY = os.environ.get("CONNECTOR_API_KEY", "")  # empty/unset = auth disabled
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 4096
@@ -345,7 +345,7 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest, x_api_key: str = Header(default="")):
-    if x_api_key != CONNECTOR_API_KEY:
+    if CONNECTOR_API_KEY and x_api_key != CONNECTOR_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     system = SYSTEM_BASE
