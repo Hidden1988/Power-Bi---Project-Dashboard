@@ -77,9 +77,21 @@ async def _primavera_headers(client: httpx.AsyncClient) -> dict:
     basic = base64.b64encode(
         f"{os.environ['PRIMAVERA_USERNAME']}:{os.environ['PRIMAVERA_PASSWORD']}".encode()
     ).decode()
-    # Build URL by hand so the scope value is sent exactly (no percent-encoding).
-    url = f"{os.environ['PRIMAVERA_BASE_URL'].rstrip('/')}{PV_TOKEN_PATH}?scope={PV_API_SCOPE}"
-    r = await client.post(url, headers={"Authorization": f"Basic {basic}", "Accept": "*/*"})
+    # Primavera requires the scope's colons/slashes UN-encoded. httpx re-encodes a
+    # query string by default, so set the raw query bytes explicitly to bypass that.
+    base = os.environ["PRIMAVERA_BASE_URL"].rstrip("/")
+    url = httpx.URL(base + PV_TOKEN_PATH).copy_with(query=f"scope={PV_API_SCOPE}".encode())
+    # Oracle requires the OAuth client-credentials grant in a form body. Omitting it
+    # returns 405 / PRM-001003010 ("missing required parameters").
+    r = await client.post(
+        url,
+        headers={
+            "Authorization": f"Basic {basic}",
+            "Accept": "*/*",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "client_credentials"},
+    )
     if r.status_code in (401, 403):
         raise RuntimeError(f"Primavera auth failed ({r.status_code}): bad service credentials")
     r.raise_for_status()
@@ -164,33 +176,60 @@ TOOLS = [
         },
     },
     {
+        "name": "aconex_field_list_projects",
+        "module": "aconex_field",
+        "path": "/field-management/api/projects",
+        "query": lambda a: {},
+        "description": "List Aconex Field projects.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "aconex_field_list_areas",
+        "module": "aconex_field",
+        "path": "/field-management/api/projects/{project_id}/areas",
+        "query": lambda a: {},
+        "description": "List the areas (locations) for an Aconex Field project. Areas are needed to reach issues.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"project_id": {"type": "string"}},
+            "required": ["project_id"],
+        },
+    },
+    {
         "name": "aconex_field_list_issues",
         "module": "aconex_field",
-        "path": "/api/projects/{projectId}/issues",     # CONFIRM path
-        "query": lambda a: {"page_size": a.get("limit", 50)},
-        "description": "List Aconex Field issues (defects/punch items) for a project.",
+        "path": "/field-management/api/projects/{project_id}/areas/{area_id}/issues",
+        "query": lambda a: {},
+        "description": "List Aconex Field issues (defects/punch items) within a given area of a project.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "projectId": {"type": "string"},
-                "limit": {"type": "integer", "description": "max rows, default 50"},
+                "project_id": {"type": "string"},
+                "area_id": {"type": "string", "description": "area id from aconex_field_list_areas"},
             },
-            "required": ["projectId"],
+            "required": ["project_id", "area_id"],
         },
     },
     {
         "name": "aconex_mail_list",
         "module": "aconex_mail",
-        "path": "/api/projects/{projectId}/mail",        # CONFIRM path
-        "query": lambda a: {"mail_box": a.get("box", "inbox")},
-        "description": "List Aconex Mail items in a project inbox/sentbox.",
+        "path": "/api/projects/{project_id}/mail",
+        "query": lambda a: {k: v for k, v in {
+            "mail_box": a.get("mail_box", "inbox"),
+            "page_size": a.get("page_size", 25),
+            "search_query": a.get("search_query"),
+        }.items() if v is not None},
+        "accept": "application/xml",   # Aconex Mail responds in XML, not JSON
+        "description": "List Aconex Mail items in a project mailbox (inbox or sentbox). Returns XML.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "projectId": {"type": "string"},
-                "box": {"type": "string", "description": "inbox or sentbox"},
+                "project_id": {"type": "string"},
+                "mail_box": {"type": "string", "description": "inbox or sentbox (default inbox)"},
+                "page_size": {"type": "integer", "description": "max rows, default 25"},
+                "search_query": {"type": "string", "description": "optional Aconex search expression"},
             },
-            "required": ["projectId"],
+            "required": ["project_id"],
         },
     },
     {
@@ -221,7 +260,7 @@ async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
     if not mod["base"]:
         return f"Module {tool['module']} is not configured (missing base URL/credentials)."
     headers = await mod["auth"](client)
-    headers["Accept"] = "application/json"
+    headers["Accept"] = tool.get("accept", "application/json")
     path = tool["path"].format(**args) if "{" in tool["path"] else tool["path"]
     url = mod["base"].rstrip("/") + path
     params = tool.get("query", lambda a: {})(args)
