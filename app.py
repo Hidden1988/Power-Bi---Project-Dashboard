@@ -282,6 +282,105 @@ TOOLS = [
     },
 ]
 
+# --- Generic GET passthrough tools: full read coverage without 400+ definitions ---
+# Each takes a relative `path` (+ optional `query`) and GETs it with the module's
+# auth. The descriptions catalogue the available resource families so Claude can
+# build correct paths. Curated tools above cover the common cases; these cover the
+# long tail. READ-ONLY: only GET is performed regardless of path.
+TOOLS += [
+    {
+        "name": "aconex_cost_get",
+        "module": "aconex_cost",
+        "dynamic": True,
+        "prefix": COST,   # /cost/api/organizations/{org}
+        "description": (
+            "GET any Aconex Cost endpoint (read-only). `path` is relative to the "
+            "org root /cost/api/organizations/{org}. Resource families: /projects, "
+            "/projects/{projectId}, and under a project: contracts, control-accounts, "
+            "control-elements, change-events, change-event-items, change-orders, "
+            "contract-change-orders, pay-items, payment-applications, "
+            "payment-application-items, period-actuals, variance-analyses, wbs, "
+            "activities, reference-documents, mails, time-phased-data, settings. "
+            "Org-level: /calendars, /currencies, /currency-exchange-rates, /eps, "
+            "/obs, /users, /security-profiles, /wbs-templates, /tag-categories, "
+            "/distribution-curves, /reporting-periods. Many list endpoints accept "
+            "page/limit query params. Example path: /projects/717861/contracts"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path relative to the org root, e.g. /projects/717861/contracts"},
+                "query": {"type": "object", "description": "Optional query params, e.g. {\"organizationRole\":\"UPSTREAM\"}"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "primavera_get",
+        "module": "primavera",
+        "dynamic": True,
+        "prefix": "",     # model supplies full /api/restapi/... path
+        "description": (
+            "GET any Primavera Cloud REST endpoint (read-only). `path` is the full "
+            "REST path beginning /api/restapi/. Families: project (and "
+            "project/workspace/{workspaceId}), workspace, program, activity "
+            "(activity/project/{projectId}), wbs (wbs/project/{projectId}), resource, "
+            "assignment, relationship, calendar, resourceDemand, "
+            "resourceRoleAssignment, baselineCategory, configuredField, cbs, "
+            "portfolioProject. Example: /api/restapi/activity/project/12345"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Full path, e.g. /api/restapi/project/workspace/123"},
+                "query": {"type": "object", "description": "Optional query params"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "aconex_field_get",
+        "module": "aconex_field",
+        "dynamic": True,
+        "prefix": "/field-management/api",
+        "description": (
+            "GET any Aconex Field endpoint (read-only). `path` is relative to "
+            "/field-management/api. Families: /projects, /projects/{projectId}/areas, "
+            "/projects/{projectId}/areas/{areaId}/issues, and other Field resources. "
+            "Example: /projects/1879048409/areas"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "query": {"type": "object", "description": "Optional query params (e.g. page_size, page_number)"},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "aconex_mail_get",
+        "module": "aconex_mail",
+        "dynamic": True,
+        "prefix": "",     # model supplies /api/...
+        "accept": "application/xml",
+        "description": (
+            "GET any Aconex Mail/Connect endpoint (read-only, returns XML). `path` "
+            "begins /api/. Examples: /api/projects (list projects), "
+            "/api/projects/{projectId}/mail (list mail, supports page_number & "
+            "page_size), /api/projects/{projectId}/mail/{mailId} (one mail item)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "query": {"type": "object", "description": "Optional query params"},
+            },
+            "required": ["path"],
+        },
+    },
+]
+
 TOOLS_BY_NAME = {t["name"]: t for t in TOOLS}
 
 
@@ -301,9 +400,17 @@ async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
         return f"Module {tool['module']} is not configured (missing base URL/credentials)."
     headers = await mod["auth"](client)
     headers["Accept"] = tool.get("accept", "application/json")
-    path = tool["path"].format(**args) if "{" in tool["path"] else tool["path"]
+    if tool.get("dynamic"):
+        # Generic passthrough: path + optional query come from the model's args.
+        rel = (args.get("path") or "").strip()
+        if rel and not rel.startswith("/"):
+            rel = "/" + rel
+        path = tool.get("prefix", "") + rel
+        params = args.get("query") or {}
+    else:
+        path = tool["path"].format(**args) if "{" in tool["path"] else tool["path"]
+        params = tool.get("query", lambda a: {})(args)
     url = mod["base"].rstrip("/") + path
-    params = tool.get("query", lambda a: {})(args)
     r = await client.get(url, headers=headers, params=params)
     r.raise_for_status()
     return r.text[:MAX_RESULT_CHARS]
