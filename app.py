@@ -12,11 +12,12 @@ Env vars (Render dashboard only, never in .env):
     ANTHROPIC_API_KEY
     CONNECTOR_API_KEY        - shared secret the Power Apps connector sends
 
-    # Primavera (Basic -> handshake -> bearer token)
+    # Primavera (Basic -> primediscovery handshake -> bearer token)
     PRIMAVERA_BASE_URL       - e.g. https://primavera-au1.oraclecloud.com
-    PRIMAVERA_TOKEN_URL      - full URL of the token/handshake endpoint
     PRIMAVERA_USERNAME
     PRIMAVERA_PASSWORD
+    PRIMAVERA_TOKEN_PATH     - optional, default /primediscovery/apitoken/request
+    PRIMAVERA_API_SCOPE      - optional, default http://primavera-au1.oraclecloud.com/api
 
     # Aconex (host shared by Field/Mail/Cost REST; auth differs per module)
     ACONEX_BASE_URL          - e.g. https://au1.aconex.com
@@ -59,19 +60,46 @@ def _basic_header(creds: Optional[str]) -> dict:
     return {"Authorization": "Basic " + base64.b64encode(creds.encode()).decode()}
 
 
+# Ported from the Primavera MCP server (index.ts mintToken). The scope is passed
+# as a RAW query-string param (its colons/slashes are intentionally not encoded),
+# the POST has Basic auth and no body, and the token may come back as raw text, a
+# quoted string, or JSON under any of several field names.
+PV_TOKEN_PATH = os.environ.get("PRIMAVERA_TOKEN_PATH", "/primediscovery/apitoken/request")
+PV_API_SCOPE = os.environ.get("PRIMAVERA_API_SCOPE", "http://primavera-au1.oraclecloud.com/api")
+
 _pv_token = {"value": None, "exp": 0.0}
 
 async def _primavera_headers(client: httpx.AsyncClient) -> dict:
-    """Basic-auth handshake -> bearer token, cached until it nears expiry."""
+    """Basic-auth handshake -> bearer token, cached for ~50 min."""
     if _pv_token["value"] and time.time() < _pv_token["exp"]:
         return {"Authorization": f"Bearer {_pv_token['value']}"}
-    basic = _basic_header(f"{os.environ['PRIMAVERA_USERNAME']}:{os.environ['PRIMAVERA_PASSWORD']}")
-    r = await client.post(os.environ["PRIMAVERA_TOKEN_URL"], headers=basic)
+
+    basic = base64.b64encode(
+        f"{os.environ['PRIMAVERA_USERNAME']}:{os.environ['PRIMAVERA_PASSWORD']}".encode()
+    ).decode()
+    # Build URL by hand so the scope value is sent exactly (no percent-encoding).
+    url = f"{os.environ['PRIMAVERA_BASE_URL'].rstrip('/')}{PV_TOKEN_PATH}?scope={PV_API_SCOPE}"
+    r = await client.post(url, headers={"Authorization": f"Basic {basic}", "Accept": "*/*"})
+    if r.status_code in (401, 403):
+        raise RuntimeError(f"Primavera auth failed ({r.status_code}): bad service credentials")
     r.raise_for_status()
-    data = r.json()
-    token = data["access_token"]                 # CONFIRM: field name from your tenant
+
+    text = r.text.strip()
+    token = text
+    if text.startswith("{"):
+        try:
+            j = r.json()
+            token = (j.get("token") or j.get("access_token") or j.get("apitoken")
+                     or j.get("apiToken") or j.get("bearerToken") or j.get("value") or text)
+        except Exception:
+            token = text
+    else:
+        token = text.strip('"')
+    if not token:
+        raise RuntimeError("Primavera token request returned an empty token")
+
     _pv_token["value"] = token
-    _pv_token["exp"] = time.time() + data.get("expires_in", 3600) - 60
+    _pv_token["exp"] = time.time() + 3000   # ~50 min; re-mint silently after
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -111,20 +139,22 @@ async def _async_const(value):
 # ---------------------------------------------------------------------------
 
 ACONEX_ORG_ID = "1476470689"   # from your Aconex Cost playbook
+# Real Cost prefix (from your server: `${ACONEX_HOST}/cost/api/organizations/${ORG}${path}`)
+COST = f"/cost/api/organizations/{ACONEX_ORG_ID}"
 
 TOOLS = [
     {
         "name": "aconex_cost_list_projects",
         "module": "aconex_cost",
-        "path": "/cost/api/v1/projects",
-        "query": lambda a: {"organizationId": ACONEX_ORG_ID},
+        "path": COST + "/projects",
+        "query": lambda a: {},
         "description": "List Aconex Cost projects for the Storco organisation.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "aconex_cost_get_project",
         "module": "aconex_cost",
-        "path": "/cost/api/v1/projects/{projectId}",
+        "path": COST + "/projects/{projectId}",
         "query": lambda a: {},
         "description": "Get one Aconex Cost project by its numeric id.",
         "input_schema": {
