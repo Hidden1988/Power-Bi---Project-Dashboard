@@ -29,6 +29,7 @@ Env vars (Render dashboard only, never in .env):
 import os
 import time
 import base64
+from datetime import date, timedelta
 import anthropic
 import httpx
 from fastapi import FastAPI, Header, HTTPException
@@ -157,6 +158,12 @@ ACONEX_ORG_ID = "1476470689"   # from your Aconex Cost playbook
 # Aconex FIELD uses a different organization id space than Cost (e.g. 18790xxxxx).
 # Set ACONEX_FIELD_ORG_ID in Render; leave blank to require the model to pass it.
 FIELD_ORG_ID = os.environ.get("ACONEX_FIELD_ORG_ID", "")
+
+def _default_daterange(years_back: int = 2) -> str:
+    """Wide trailing window so the daily-reports filter is callable without a date."""
+    today = date.today()
+    start = today - timedelta(days=365 * years_back)
+    return f"{start.strftime('%Y%m%d')}-{today.strftime('%Y%m%d')}"
 # Real Cost prefix (from your server: `${ACONEX_HOST}/cost/api/organizations/${ORG}${path}`)
 COST = f"/cost/api/organizations/{ACONEX_ORG_ID}"
 
@@ -228,7 +235,7 @@ TOOLS = [
         "path": "/field-management/api/projects/{project_id}/daily-reports/filter",
         "query": lambda a: {k: v for k, v in {
             "organizationId": a.get("organizationId") or FIELD_ORG_ID,
-            "dailyreport_daterange": a["dailyreport_daterange"],
+            "dailyreport_daterange": a.get("dailyreport_daterange") or _default_daterange(),
             "status": a.get("status", ""),          # e.g. "approved" for completed reports
             "offset_from_utc": a.get("offset_from_utc", "600"),  # AEST = +600 min
             "search_string": a.get("search_string", ""),
@@ -255,7 +262,7 @@ TOOLS = [
                 "search_string": {"type": "string"},
                 "report_owner": {"type": "string", "description": "comma-separated report owner ids"},
             },
-            "required": ["project_id", "dailyreport_daterange"],
+            "required": ["project_id"],
         },
     },
     {
@@ -404,12 +411,13 @@ TOOLS += [
             "/field-management/api. Aconex Field has DISTINCT record types - do not "
             "confuse them: Daily Reports (the daily site reports/diary), Checklists "
             "(inspections), Issues (defects/punch items), Observations (safety), and "
-            "Templates. Families: /projects, /projects/{projectId}/areas, "
-            "/projects/{projectId}/areas/{areaId}/issues, "
-            "/projects/{projectId}/daily-reports, /projects/{projectId}/checklists, "
-            "/projects/{projectId}/observations, /projects/{projectId}/templates. "
-            "A 'site report' means a Daily Report, NOT a checklist. "
-            "Example: /projects/1879048409/daily-reports"
+            "Templates. For DAILY REPORTS use the dedicated tools "
+            "aconex_field_daily_reports_filter / aconex_field_daily_report_get - there "
+            "is NO bare GET /projects/{id}/daily-reports (it returns 405); reports are "
+            "reached via /daily-reports/filter or /daily-reports/{id}?type=DAILY_REPORT. "
+            "Other families: /projects, /projects/{projectId}/areas, "
+            "/projects/{projectId}/areas/{areaId}/issues. "
+            "A 'site report' means a Daily Report, NOT a checklist."
         ),
         "input_schema": {
             "type": "object",
