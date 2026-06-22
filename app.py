@@ -40,8 +40,9 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CONNECTOR_API_KEY = os.environ["CONNECTOR_API_KEY"]
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 2048
-MAX_TOOL_ROUNDS = 6
+MAX_TOKENS = 4096
+MAX_TOOL_ROUNDS = 12          # higher: pagination needs several tool round-trips
+MAX_RESULT_CHARS = 60000     # per tool result returned to the model
 
 app = FastAPI(title="Storco read-only data backend")
 app.add_middleware(
@@ -200,13 +201,19 @@ TOOLS = [
         "name": "aconex_field_list_issues",
         "module": "aconex_field",
         "path": "/field-management/api/projects/{project_id}/areas/{area_id}/issues",
-        "query": lambda a: {},
-        "description": "List Aconex Field issues (defects/punch items) within a given area of a project.",
+        "query": lambda a: {k: v for k, v in {
+            "page_size": a.get("page_size", 200),
+            "page_number": a.get("page_number", 1),
+        }.items() if v is not None},
+        "description": ("List Aconex Field issues (defects/punch items) within an area of a project. "
+                        "Returns one page; call again with the next page_number for more."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "area_id": {"type": "string", "description": "area id from aconex_field_list_areas"},
+                "page_size": {"type": "integer", "description": "rows per page, default 200"},
+                "page_number": {"type": "integer", "description": "1-based page index, default 1"},
             },
             "required": ["project_id", "area_id"],
         },
@@ -226,17 +233,20 @@ TOOLS = [
         "path": "/api/projects/{project_id}/mail",
         "query": lambda a: {k: v for k, v in {
             "mail_box": a.get("mail_box", "inbox"),
-            "page_size": a.get("page_size", 25),
+            "page_size": a.get("page_size", 250),
+            "page_number": a.get("page_number", 1),
             "search_query": a.get("search_query"),
         }.items() if v is not None},
         "accept": "application/xml",   # Aconex Mail responds in XML, not JSON
-        "description": "List Aconex Mail items in a project mailbox (inbox or sentbox). Returns XML.",
+        "description": ("List Aconex Mail items in a project mailbox (inbox or sentbox). Returns XML. "
+                        "Returns one page; to see more, call again with the next page_number."),
         "input_schema": {
             "type": "object",
             "properties": {
                 "project_id": {"type": "string"},
                 "mail_box": {"type": "string", "description": "inbox or sentbox (default inbox)"},
-                "page_size": {"type": "integer", "description": "max rows, default 25"},
+                "page_size": {"type": "integer", "description": "rows per page, default 250"},
+                "page_number": {"type": "integer", "description": "1-based page index, default 1"},
                 "search_query": {"type": "string", "description": "optional Aconex search expression"},
             },
             "required": ["project_id"],
@@ -296,7 +306,7 @@ async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
     params = tool.get("query", lambda a: {})(args)
     r = await client.get(url, headers=headers, params=params)
     r.raise_for_status()
-    return r.text[:20000]
+    return r.text[:MAX_RESULT_CHARS]
 
 
 # ---------------------------------------------------------------------------
