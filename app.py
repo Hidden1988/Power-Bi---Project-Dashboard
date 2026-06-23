@@ -28,6 +28,7 @@ Env vars (Render dashboard only, never in .env):
 
 import os
 import time
+import json
 import base64
 from datetime import date, timedelta
 import anthropic
@@ -167,6 +168,116 @@ def _default_daterange(years_back: int = 2) -> str:
 # Real Cost prefix (from your server: `${ACONEX_HOST}/cost/api/organizations/${ORG}${path}`)
 COST = f"/cost/api/organizations/{ACONEX_ORG_ID}"
 
+
+def _rows_from(payload):
+    """Daily-reports filter response shape varies; pull the list of report rows out."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for k in ("dailyReports", "daily_reports", "items", "results", "searchResults", "data"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return v
+        # single object that looks like a row
+        if "dailyReportDate" in payload or "status" in payload:
+            return [payload]
+    return []
+
+
+def _slim_daily_report(rep):
+    """A full daily report embeds its entire template (columns + huge response_options
+    lists) per table. Keep only the real content: status, date, who/when, and the
+    actual filled-in values. Drops the template metadata that bloats the payload."""
+    if not isinstance(rep, dict):
+        return rep
+    out = {k: rep.get(k) for k in
+           ("id", "status", "type", "description", "dailyReportDate") if k in rep}
+    for k in ("meta_data", "report_owner", "reportOwner", "createdBy", "updatedBy",
+              "submittedBy", "submittedAt"):
+        if rep.get(k):
+            out[k] = rep[k]
+    groups = []
+    for g in rep.get("groups", []) or []:
+        grp = {"group": g.get("groupCode") or g.get("description")}
+        items = [{it.get("code"): (it.get("response") or {}).get("value")}
+                 for it in (g.get("items") or [])
+                 if (it.get("response") or {}).get("value")]
+        rows = []
+        for t in (g.get("tables") or []):
+            for row in (t.get("rows") or []):
+                rm = {ri.get("code"): ri.get("value")
+                      for ri in (row.get("rowItems") or []) if ri.get("value")}
+                if rm:
+                    rows.append(rm)
+        if items:
+            grp["items"] = items
+        if rows:
+            grp["rows"] = rows
+        if items or rows:
+            groups.append(grp)
+    if groups:
+        out["groups"] = groups
+    return out
+
+
+async def _field_daily_reports_handler(args, client):
+    """Composite: sweep org user ids -> filter daily reports -> keep real submitted
+    rows in-app -> fetch full detail by id for the latest few."""
+    project_id = str(args["project_id"])
+    daterange = args.get("dailyreport_daterange") or _default_daterange()
+    want = (args.get("status") or "submitted").lower()   # "submitted" | "any"
+    limit = int(args.get("limit", 3))
+    base = MODULES["aconex_field"]["base"].rstrip("/")
+    fh = await MODULES["aconex_field"]["auth"](client)
+    fh["Accept"] = "application/json"
+
+    # 1) org users -> report_owner ids (Connect API, same host)
+    ur = await client.get(base + "/api/organizations/1476470689/users",
+                          headers=fh, params={"page_size": 1000})
+    ur.raise_for_status()
+    users = _rows_from(ur.json()) or ur.json().get("searchResults", [])
+    owner_ids = ",".join(str(u.get("userId")) for u in users if u.get("userId"))
+    if not owner_ids:
+        return "Could not resolve any org user ids to use as report_owner."
+
+    # 2) filter daily reports for the project, scoped by those owners
+    fr = await client.get(
+        base + f"/field-management/api/projects/{project_id}/daily-reports/filter",
+        headers=fh,
+        params={"organizationId": FIELD_ORG_ID, "dailyreport_daterange": daterange,
+                "report_owner": owner_ids, "offset_from_utc": "600"},
+    )
+    fr.raise_for_status()
+    rows = _rows_from(fr.json())
+
+    # 3) keep real rows (non-null id) matching the wanted status, newest first
+    real = [r for r in rows if r.get("id") and
+            (want == "any" or str(r.get("status", "")).lower() == want)]
+    real.sort(key=lambda r: str(r.get("dailyReportDate", "")), reverse=True)
+    selected = real[:limit]
+
+    if not selected:
+        return json.dumps({
+            "summary": f"No {want} daily reports found for project {project_id} in {daterange}.",
+            "rows_scanned": len(rows), "real_non_dummy": len(real),
+        })
+
+    # 4) full detail by id for the selected reports (who/when lives in meta_data)
+    details = []
+    for r in selected:
+        dr = await client.get(
+            base + f"/field-management/api/projects/{project_id}/daily-reports/{r['id']}",
+            headers=fh, params={"type": "DAILY_REPORT"})
+        dr.raise_for_status()
+        try:
+            details.append(_slim_daily_report(dr.json()))
+        except Exception:
+            details.append({"id": r["id"], "raw": dr.text[:4000]})
+
+    return json.dumps({"matched": len(real), "returned": len(selected), "reports": details},
+                      default=str)[:MAX_RESULT_CHARS]
+
+
 TOOLS = [
     {
         "name": "aconex_cost_list_projects",
@@ -244,6 +355,29 @@ TOOLS = [
             "type": "object",
             "properties": {"page_size": {"type": "integer", "description": "default 1000"}},
             "required": [],
+        },
+    },
+    {
+        "name": "aconex_field_daily_reports",
+        "module": "aconex_field",
+        "handler": _field_daily_reports_handler,
+        "description": (
+            "PREFERRED way to get Aconex Field daily reports (site reports/diary) for a "
+            "project. Does everything server-side: sweeps all org user ids as "
+            "report_owner (required or the API only returns empty placeholders), pulls "
+            "the report list, keeps only REAL submitted reports, sorts newest-first, and "
+            "returns full detail (incl. meta_data = who completed it and when) for the "
+            "latest few. Use this for any 'latest/recent completed site report' question."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"},
+                "dailyreport_daterange": {"type": "string", "description": "YYYYMMDD-YYYYMMDD; defaults to last 2 years"},
+                "status": {"type": "string", "description": "'submitted' (default, = completed) or 'any'"},
+                "limit": {"type": "integer", "description": "how many latest reports to return in full, default 3"},
+            },
+            "required": ["project_id"],
         },
     },
     {
@@ -486,6 +620,8 @@ async def run_tool(name: str, args: dict, client: httpx.AsyncClient) -> str:
     mod = MODULES[tool["module"]]
     if not mod["base"]:
         return f"Module {tool['module']} is not configured (missing base URL/credentials)."
+    if tool.get("handler"):
+        return await tool["handler"](args, client)
     headers = await mod["auth"](client)
     headers["Accept"] = tool.get("accept", "application/json")
     if tool.get("dynamic"):
@@ -558,12 +694,10 @@ SYSTEM_BASE = (
     "if you can only find a different type, say so explicitly rather than presenting "
     "it as the thing requested (e.g. never return a checklist when asked for a site "
     "report without flagging that it is a checklist, not a report).\n\n"
-    "Daily reports lookup: the daily-reports filter returns only dummy not_started "
-    "rows unless report_owner ids are supplied. So to find real/completed site "
-    "reports: (1) call aconex_list_org_users and collect the userId values, (2) call "
-    "aconex_field_daily_reports_filter with report_owner set to those ids "
-    "(comma-separated) and dailyreport_status=submitted, (3) take the latest and call "
-    "aconex_field_daily_report_get for who completed it and when."
+    "Daily reports lookup: use aconex_field_daily_reports - it sweeps owner ids, "
+    "keeps only real submitted reports, and returns full who/when detail in one call. "
+    "(The lower-level filter returns dummy not_started rows unless report_owner ids "
+    "are supplied, so prefer the composite tool.)"
 )
 
 
